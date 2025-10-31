@@ -207,8 +207,31 @@ std_win  = st.sidebar.number_input("Janela do desvio padrão (Z-score)", min_val
 z_cap    = st.sidebar.slider("Saturação de Z (|Z| máximo)",             min_value=0.5, max_value=3.0,  value=2.0, step=0.1)
 z_thresh = st.sidebar.slider("Zona neutra |Z| ≤",                        min_value=0.0, max_value=2.0,  value=0.5, step=0.1)
 
-# >>> bins do histograma (Gráf. 0)
+# >>> bins do histograma
 bins_num = st.sidebar.slider("Histograma: nº de bins (Gráf. 0)", min_value=10, max_value=100, value=30, step=1)
+
+# >>> Estratégia (inclui Fusão)
+strategy_mode = st.sidebar.radio(
+    "Estratégia de tilt",
+    ["Reversão à média", "Momentum", "Fusão (mix)"],
+    index=0,
+    help="Reversão: z>0 reduz peso; Momentum: z>0 aumenta peso; Fusão: mistura ponderada."
+)
+
+# Controle da mistura (só relevante na Fusão)
+mix_alpha = 0.5
+if strategy_mode.startswith("Fusão"):
+    mix_alpha = st.sidebar.slider(
+        "Mix da Fusão – α (0 = 100% Reversão, 1 = 100% Momentum)",
+        min_value=0.0, max_value=1.0, value=0.5, step=0.05
+    )
+
+# Agressividade global
+aggr_factor = st.sidebar.slider(
+    "Agressividade do tilt",
+    min_value=0.0, max_value=2.0, value=1.0, step=0.1,
+    help="Multiplica a intensidade do tilt. 0=sem tilt; 1=padrão; 2=dobro da intensidade."
+)
 
 st.sidebar.subheader("Pesos táticos")
 mode_pesos = st.sidebar.radio(
@@ -216,13 +239,6 @@ mode_pesos = st.sidebar.radio(
     options=["Contínuos (livres)", "Degraus de 2,5 p.p."],
     index=0,
     help="Degraus: arredonda a 2,5% respeitando MIN/MAX e mantém a soma em 100%."
-)
-
-# >>> NOVO: agressividade do tilt
-aggr = st.sidebar.slider(
-    "Agressividade do tilt (×)",
-    min_value=0.0, max_value=2.0, value=1.0, step=0.05,
-    help="Multiplica a intensidade do deslocamento em relação ao NEUTRO. 0 = sem tilt; 1 = padrão; 2 = mais agressivo."
 )
 
 # Trava de classe
@@ -354,17 +370,35 @@ for c in CLASSES:
     z_all[c] = ((ma_s - ma_l) / sd.replace(0, np.nan)).clip(-10, 10)
 z_all_df = pd.DataFrame(z_all).reindex(rets.index)
 
-def tactical_weight_row(row, z_row, aggr_factor):
+def tactical_weight_row(row, z_row, mode: str, alpha_mix: float, aggr_factor: float):
+    """
+    Z -> peso tático partindo do NEUTRO.
+    mode: "Reversão à média" | "Momentum" | "Fusão (mix)"
+    alpha_mix in [0,1]: fração de Momentum na mistura (só usado em Fusão).
+    aggr_factor: multiplica a intensidade do tilt.
+    """
     if np.isnan(z_row):
         return row["NEUTRO"]
     if abs(z_row) <= z_thresh:
         return row["NEUTRO"]
-    # fração proporcional saturada em z_cap
+
+    # intensidade (saturada) * agressividade
     frac = min(abs(z_row), z_cap) / z_cap
-    # aplica agressividade e limita em [0,1]
     frac = max(0.0, min(1.0, aggr_factor * frac))
-    return row["NEUTRO"] + (row["MAX"] - row["NEUTRO"])*frac if z_row > 0 \
-                          else row["NEUTRO"] + (row["MIN"] - row["NEUTRO"])*frac
+
+    # alvos das duas "filosofias"
+    target_mom = row["MAX"] if z_row > 0 else row["MIN"]
+    target_mr  = row["MIN"] if z_row > 0 else row["MAX"]
+
+    if mode.startswith("Momentum"):
+        target = target_mom
+    elif mode.startswith("Reversão"):
+        target = target_mr
+    else:
+        # Fusão: combinação convexa (alpha_mix = % Momentum)
+        target = alpha_mix * target_mom + (1.0 - alpha_mix) * target_mr
+
+    return row["NEUTRO"] + (target - row["NEUTRO"]) * frac
 
 # matrizes base
 w_neutro = pd.DataFrame(
@@ -378,7 +412,7 @@ for i, c in enumerate(CLASSES):
     if c in frozen_classes:
         w_tatico_raw[c] = pd.Series(row["NEUTRO"], index=rets.index)  # travado no neutro
     else:
-        w_tatico_raw[c] = z_all_df[c].apply(lambda zval: tactical_weight_row(row, zval, aggr))
+        w_tatico_raw[c] = z_all_df[c].apply(lambda zval: tactical_weight_row(row, zval, strategy_mode, mix_alpha, aggr_factor))
 
 # limites (travados: MIN=MAX=NEUTRO)
 mins = weights_edit["MIN"].values.copy()
@@ -450,8 +484,8 @@ rule_neutral_up = alt.Chart(z_long).mark_rule(color="#999", strokeDash=[3,3]).en
 rule_neutral_dn = alt.Chart(z_long).mark_rule(color="#999", strokeDash=[3,3]).encode(y=alt.datum(-z_thresh))
 rule_cap_up     = alt.Chart(z_long).mark_rule(color=PRIMARY_2, strokeDash=[6,4]).encode(y=alt.datum(z_cap))
 rule_cap_dn     = alt.Chart(z_long).mark_rule(color=PRIMARY_2, strokeDash=[6,4]).encode(y=alt.datum(-z_cap))
-highlight = alt.selection_point(fields=["Classe"], bind="legend")
 
+highlight = alt.selection_point(fields=["Classe"], bind="legend")
 z_all_chart = (
     alt.Chart(z_long)
        .mark_line(opacity=0.9)
@@ -486,6 +520,7 @@ else:
     cost_series = pd.Series(0.0, index=ret_tatico_bruto.index)
     ret_tatico_liquido = ret_tatico_bruto
 
+# Curvas base 100 com paleta
 curve = pd.DataFrame({
     "Data": rets.index,
     "Neutra":           cum_base100(ret_neutro, base),
@@ -582,22 +617,23 @@ st.altair_chart(scatter, use_container_width=True)
 # ===============================
 # Rodapé
 # ===============================
-with st.expander("Como funciona o peso tático?"):
+with st.expander("Como funciona o tilt e a Fusão?"):
     st.write(
         f"""
-        Para cada classe, computo o Z-score com as janelas escolhidas. Em seguida:
-        - Se |Z| ≤ {z_thresh}: peso = **Neutro**
-        - Se Z > {z_thresh}: movo do **Neutro** até o **Máx** proporcionalmente a |Z|, saturando em |Z|={z_cap}
-        - Se Z < -{z_thresh}: movo do **Neutro** até o **Mín** proporcionalmente a |Z|, saturando em |Z|={z_cap}
+        **Z-score**: (média curta − média longa) / desvio-padrão (janela).  
+        - **Zona neutra**: |Z| ≤ {z_thresh}  
+        - **Saturação**: |Z| ≥ {z_cap}
 
-        **Agressividade do tilt (×)** = {aggr:.2f}: multiplica a intensidade do deslocamento.
-        0 = sem tilt; 1 = padrão; 2 = mais agressivo. Sempre respeito **MIN/MAX** e a soma 100%.
-        No modo **Degraus 2,5 p.p.**, faço arredondamento/ajuste em passos de 2,5% mantendo restrições.
-        Classes **travadas** ficam exatamente no **NEUTRO** (MIN=MAX=NEUTRO) e não variam.
+        **Estratégias**:
+        - **Reversão à média**: Z>0 → alvo = MIN; Z<0 → alvo = MAX.  
+        - **Momentum**: Z>0 → alvo = MAX; Z<0 → alvo = MIN.  
+        - **Fusão (mix)**: alvo = α·(Momentum) + (1−α)·(Reversão).  
+          *α* é o **Mix da Fusão** (controle na barra lateral).
 
-        Custo (se ativado): **turnover = 0,5 × soma(|w_t − w_(t−1)|)** e
-        **custo = turnover × {cost_pct:.2%}**.
-
-        Gráfico 0 (histograma): média ({PRIMARY_2}) e linhas tracejadas em ±1σ.
+        **Agressividade**: multiplica a intensidade do tilt (0=sem tilt, 1=padrão, 2=dobro).  
+        **Contínuos**: projetamos os pesos para respeitar **MIN/MAX** e somar 100%.  
+        **Degraus 2,5 p.p.**: quantizamos mantendo soma=100% e limites.  
+        **Classes travadas**: MIN=MAX=NEUTRO (não variam).  
+        **Custo (se ativado)**: turnover = 0,5 × soma(|w_t − w_(t−1)|); custo = turnover × {cost_pct:.2%}.
         """
     )
